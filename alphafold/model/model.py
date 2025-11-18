@@ -35,11 +35,13 @@ class RunModel:
   def __init__(self,
                config: ml_collections.ConfigDict,
                params: Optional[Mapping[str, Mapping[str, np.ndarray]]] = None,
-               is_training = False):
+               is_training = False, extended_ptm_config=None):
     
     self.config = config
     self.params = params
     self.multimer_mode = config.model.global_config.multimer_mode
+    self.config.model.calc_extended_ptm = extended_ptm_config['calc_extended_ptm'] if extended_ptm_config else False
+    self.config.model.use_probs_extended = extended_ptm_config['use_probs_extended'] if extended_ptm_config else False
 
     if self.multimer_mode:
       def _forward_fn(batch):
@@ -122,7 +124,6 @@ class RunModel:
               feat: features.FeatureDict,
               random_seed: int = 0,
               return_representations: bool = False,
-              fix_single_representation: bool = True,
               callback: Any = None) -> Mapping[str, Any]:
     """Makes a prediction by inferencing the model on the provided features.
 
@@ -149,11 +150,16 @@ class RunModel:
       L = aatype.shape[1]
     
     # initialize
-
     zeros = lambda shape: np.zeros(shape, dtype=np.float16)
     prev = {'prev_msa_first_row': zeros([L,256]),
-            'prev_pair':          zeros([L,L,128]),
-            'prev_pos':           zeros([L,37,3])}
+            'prev_pair':          zeros([L,L,128])}
+    
+    # initial guess
+    if "all_atom_positions" in feat:
+      logging.info("INFO: using provided all_atom_positions as initial guess")
+      prev["prev_pos"] = feat["all_atom_positions"]
+    else:
+      prev["prev_pos"] = np.zeros([L,37,3])
     
     def run(key, feat, prev):
       def _jnp_to_np(x):
@@ -168,14 +174,10 @@ class RunModel:
       return result, prev
 
 
-    if return_representations and fix_single_representation:
-      single_act = self.params['alphafold/alphafold_iteration/evoformer/single_activations']
-      single_act = jax.tree_map(lambda x:np.asarray(x, dtype=np.float16), single_act)
-
     # initialize random key
     key = jax.random.PRNGKey(random_seed)
     
-    # iterate through recyckes
+    # iterate through recycles
     for r in range(num_iters):      
         # grab subset of features
         if self.multimer_mode:
@@ -183,18 +185,16 @@ class RunModel:
         else:
           s = r * num_ensemble
           e = (r+1) * num_ensemble
-          sub_feat = jax.tree_map(lambda x:x[s:e], feat)
+          sub_feat = jax.tree_util.tree_map(lambda x:x[s:e], feat)
             
         # run
         key, sub_key = jax.random.split(key)
         result, prev = run(sub_key, sub_feat, prev)
         
         if return_representations:
-          single = prev["prev_msa_first_row"]
-          if fix_single_representation:
-            single = single @ single_act["weights"] + single_act["bias"]
+
           result["representations"] = {"pair":   prev["prev_pair"],
-                                       "single": single}
+                                       "single": prev["prev_msa_first_row"]}
                                        
         # callback
         if callback is not None: callback(result, r)
@@ -204,6 +204,5 @@ class RunModel:
           break
         if r > 0 and result["tol"] < self.config.model.recycle_early_stop_tolerance:
           break
-
     logging.info('Output shape was %s', tree.map_structure(lambda x: x.shape, result))
     return result, r

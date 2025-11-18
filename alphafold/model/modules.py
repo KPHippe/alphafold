@@ -181,12 +181,12 @@ class AlphaFold_noE(hk.Module):
 
     prev = batch.pop("prev",None)
     if batch["aatype"].ndim == 2:
-      batch = jax.tree_map(lambda x:x[0], batch)
+      batch = jax.tree_util.tree_map(lambda x:x[0], batch)
 
     # initialize
     if prev is None:
 
-      L = batch["aatype"].shape[0]
+      L = num_residues
       prev = {'prev_msa_first_row': jnp.zeros([L,256]),
               'prev_pair':          jnp.zeros([L,L,128]),
               'prev_pos':           jnp.zeros([L,37,3])}
@@ -206,6 +206,7 @@ class AlphaFold_noE(hk.Module):
       prediction_result=ret,
       mask=batch["seq_mask"],
       rank_by=self.config.rank_by,
+      keep_pae=self.config.calc_extended_ptm,
       use_jnp=True))
       
     ret["tol"] = confidence.compute_tol(
@@ -413,7 +414,7 @@ class AlphaFold(hk.Module):
           'prev_msa_first_row': ret['representations']['msa_first_row'],
           'prev_pair': ret['representations']['pair'],
       }
-      return jax.tree_map(jax.lax.stop_gradient, new_prev)
+      return jax.tree_util.tree_map(jax.lax.stop_gradient, new_prev)
 
     def do_call(prev,
                 recycle_idx,
@@ -424,12 +425,12 @@ class AlphaFold(hk.Module):
           start = recycle_idx * num_ensemble
           size = num_ensemble
           return jax.lax.dynamic_slice_in_dim(x, start, size, axis=0)
-        ensembled_batch = jax.tree_map(slice_recycle_idx, batch)
+        ensembled_batch = jax.tree_util.tree_map(slice_recycle_idx, batch)
       else:
         num_ensemble = batch_size
         ensembled_batch = batch
 
-      non_ensembled_batch = jax.tree_map(lambda x: x, prev)
+      non_ensembled_batch = jax.tree_util.tree_map(lambda x: x, prev)
 
       return impl(
           ensembled_batch=ensembled_batch,
@@ -467,7 +468,7 @@ class AlphaFold(hk.Module):
       mask=batch["seq_mask"][0],
       rank_by=self.config.rank_by,
       use_jnp=True))
-      
+
     ret["tol"] = confidence.compute_tol(
       prev["prev_pos"], 
       ret["prev"]["prev_pos"],
@@ -672,10 +673,8 @@ class Attention(hk.Module):
     logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + bias
     if nonbatched_bias is not None:
       logits += jnp.expand_dims(nonbatched_bias, axis=0)
-    
-    # patch for jax > 0.3.25
-    logits = jnp.clip(logits,-1e8,1e8)
-      
+    # fix NaN's in jax >= 0.4, different fix than in AF2
+    logits = jnp.clip(logits, -1e8, 1e8)
     weights = jax.nn.softmax(logits)
     weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
 
@@ -775,6 +774,8 @@ class GlobalAttention(hk.Module):
     k = jnp.einsum('bka,ac->bkc', m_data, k_weights)
     bias = (1e9 * (q_mask[:, None, :, 0] - 1.))
     logits = jnp.einsum('bhc,bkc->bhk', q, k) + bias
+    # fix NaN's in jax >= 0.4, different fix than in AF2
+    logits = jnp.clip(logits, -1e8, 1e8)
     weights = jax.nn.softmax(logits)
     weighted_avg = jnp.einsum('bhk,bkc->bhc', weights, v)
 
@@ -1929,7 +1930,7 @@ class EmbeddingsAndEvoformer(hk.Module):
       if c.max_relative_feature:
         # Add one-hot-encoded clipped residue distances to the pair activations.
         pos = batch['residue_index']
-        offset = batch.pop("offset", pos[:,None] - pos[None,:])
+        offset = pos[:,None] - pos[None,:]
         offset = jnp.clip(offset + c.max_relative_feature, a_min=0, a_max=2 * c.max_relative_feature)
         if "asym_id" in batch:
           o = batch['asym_id'][:,None] - batch['asym_id'][None,:]
